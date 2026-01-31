@@ -234,7 +234,7 @@ Install scipy for full functionality: `pip install scipy`
 
 ## Data Format
 
-The logger outputs tab-separated values. The header shows `timestamp` but the data has separate `date` and `time` columns. Columns vary based on available/requested metrics:
+The logger outputs tab-separated values. Columns vary based on available/requested metrics:
 
 **Always included:**
 ```

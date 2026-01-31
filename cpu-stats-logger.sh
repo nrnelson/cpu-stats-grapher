@@ -450,7 +450,7 @@ PREV_IDLE=0
 
 # Build dynamic header
 CORE_COUNT=$(nproc)
-HEADER="timestamp\tload_avg\tusage_pct"
+HEADER="date\ttime\tload_avg\tusage_pct"
 
 if $COLLECT_TEMP; then
     HEADER+="\ttemp_c"
