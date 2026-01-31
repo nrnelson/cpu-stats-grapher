@@ -68,7 +68,7 @@ If none are available (only basic /proc data), the logger exits with an error ra
 ```bash
 git clone https://github.com/nrnelson/cpu-stats-grapher.git
 cd cpu-stats-grapher
-pip install -r requirements.txt
+pip install -r requirements.txt  # optionally in a venv
 ```
 
 ## Usage
