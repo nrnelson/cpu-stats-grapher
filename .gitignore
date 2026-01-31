@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Generated output
+*.log
+*.png
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code
+.claude/
+
+# Planning documents
+PLAN*.md
