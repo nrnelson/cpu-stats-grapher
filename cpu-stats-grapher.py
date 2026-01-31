@@ -150,14 +150,13 @@ def load_data(filepath: Path) -> pd.DataFrame:
     # Rename columns for easier access
     df.columns = df.columns.str.strip()
 
-    # Build datetime index from date + time columns (first two whitespace-separated parts of timestamp)
-    # The log format has: "2026-01-29  22:45:08" as first entry which becomes the index
+    # Build datetime index from date + time columns
+    # Header format: date, time, load_avg, usage_pct, [temp_c], [power_w, ccd0_w, ccd1_w], [core*_mhz]
     first_col = df.columns[0].lower()
 
-    # Parse datetime - handle both "YYYY-MM-DD HH:MM:SS" combined and separate columns
-    if 'timestamp' in first_col or len(df.columns) >= 3:
-        # Data appears to have date and time as separate values in first two data positions
-        # Re-read with proper handling
+    # Parse datetime - date and time are separate columns
+    if first_col == 'date' or len(df.columns) >= 4:
+        # Re-read with whitespace separator to handle tab-separated data
         df = pd.read_csv(filepath, sep=r'\s+', engine='python', skiprows=1, header=None)
 
         # Get header to determine column layout
@@ -165,48 +164,27 @@ def load_data(filepath: Path) -> pd.DataFrame:
             header_line = f.readline().strip()
         header_cols = header_line.split('\t')
 
-        # Determine format based on header
-        # New format always has timestamp, load_avg, usage_pct as first 3 columns
-        # Then optional: temp_c, power_w, ccd0_w, ccd1_w, core*_mhz
-
         num_data_cols = len(df.columns)
-        core_count = 0
 
-        # Count core columns in header
-        for col in header_cols:
-            if col.startswith('core') and col.endswith('_mhz'):
-                core_count += 1
-
-        # Build column names based on header
-        col_names = ['date', 'time']
-        header_idx = 1  # Skip 'timestamp' which becomes date+time
-
-        for col in header_cols[1:]:  # Skip timestamp
-            if col.startswith('core') and col.endswith('_mhz'):
-                col_names.append(col)
-            else:
-                col_names.append(col)
-
-        # Adjust for actual data columns (date and time are split)
-        if len(col_names) == num_data_cols:
-            df.columns = col_names
+        # Header has: date, time, load_avg, usage_pct, [optional cols...]
+        # Use header directly since it now matches the data format
+        if len(header_cols) == num_data_cols:
+            df.columns = header_cols
         else:
-            # Fallback: try to detect format by column count
-            core_cols = [f'core{i}_mhz' for i in range(32)]
+            # Fallback: build column names from header, accounting for any mismatch
+            core_cols = [f'core{i}_mhz' for i in range(64)]
 
-            # Check various formats
+            # Check various formats by column count
             if num_data_cols >= 40:
-                # Full format with power and CCD
-                df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct',
+                # Full format with temp, power, CCD, and clocks
+                df.columns = ['date', 'time', 'load_avg', 'usage_pct', 'temp_c',
                               'power_w', 'ccd0_w', 'ccd1_w'] + core_cols[:num_data_cols - 8]
-            elif num_data_cols >= 37:
-                # Old format without power
-                df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct'] + core_cols[:num_data_cols - 5]
+            elif num_data_cols >= 36:
+                # Temp + clocks (no power)
+                df.columns = ['date', 'time', 'load_avg', 'usage_pct', 'temp_c'] + core_cols[:num_data_cols - 5]
             elif 'temp_c' in header_cols:
-                # Has temperature
-                base_cols = ['date', 'time', 'load_avg', 'usage_pct']
-                if 'temp_c' in header_cols:
-                    base_cols.append('temp_c')
+                # Has temperature - build based on header
+                base_cols = ['date', 'time', 'load_avg', 'usage_pct', 'temp_c']
                 if 'power_w' in header_cols:
                     if 'ccd0_w' in header_cols:
                         base_cols.extend(['power_w', 'ccd0_w', 'ccd1_w'])
@@ -215,12 +193,12 @@ def load_data(filepath: Path) -> pd.DataFrame:
                 remaining = num_data_cols - len(base_cols)
                 df.columns = base_cols + core_cols[:remaining]
             else:
-                # Minimal format: timestamp, load_avg, usage_pct + optional columns
+                # Minimal format: date, time, load_avg, usage_pct + optional columns
                 base_cols = ['date', 'time', 'load_avg', 'usage_pct']
                 remaining = num_data_cols - len(base_cols)
                 df.columns = base_cols + core_cols[:remaining]
 
-        # Combine date and time
+        # Combine date and time into datetime
         df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y-%m-%d %H:%M:%S')
     else:
         df['datetime'] = pd.to_datetime(df.iloc[:, 0])
@@ -391,8 +369,8 @@ def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = Fals
         print(f"\n{'--- Thermal Headroom ---':^60}")
         print(f"{'  TJMax:':<25} {tjmax:.0f}{unit}")
         print(f"{'  Headroom (TJMax - Max):':<25} {stats_dict['headroom']:.2f}{unit}")
-        print(f"{'  Time above {thresh_85:.0f}{unit}:':<25} {stats_dict['time_above_85']:.1f}%")
-        print(f"{'  Time above {thresh_90:.0f}{unit}:':<25} {stats_dict['time_above_90']:.1f}%")
+        print(f"  Time above {thresh_85:.0f}{unit}:".ljust(25) + f" {stats_dict['time_above_85']:.1f}%")
+        print(f"  Time above {thresh_90:.0f}{unit}:".ljust(25) + f" {stats_dict['time_above_90']:.1f}%")
         print(f"{'  Time above TJMax:':<25} {stats_dict['time_above_tjmax']:.1f}%")
 
     if 'clock_mean' in stats_dict:
@@ -684,27 +662,32 @@ def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool =
                           c=colors, cmap='viridis', alpha=0.6, s=20)
     plt.colorbar(scatter, label='Time (start → end)')
 
-    # Trend line
-    if len(valid) > 2:
-        if SCIPY_AVAILABLE:
-            slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(
-                valid['usage_pct'], valid['temp_c'])
-        else:
-            # Numpy fallback
-            coeffs = np.polyfit(valid['usage_pct'], valid['temp_c'], 1)
-            slope, intercept = coeffs
-            r_value = np.corrcoef(valid['usage_pct'], valid['temp_c'])[0, 1]
+    # Trend line (only if there's variance in the data)
+    usage_range = valid['usage_pct'].max() - valid['usage_pct'].min()
+    if len(valid) > 2 and usage_range > 0:
+        try:
+            if SCIPY_AVAILABLE:
+                slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(
+                    valid['usage_pct'], valid['temp_c'])
+            else:
+                # Numpy fallback
+                coeffs = np.polyfit(valid['usage_pct'], valid['temp_c'], 1)
+                slope, intercept = coeffs
+                r_value = np.corrcoef(valid['usage_pct'], valid['temp_c'])[0, 1]
 
-        x_line = np.array([valid['usage_pct'].min(), valid['usage_pct'].max()])
-        y_line = slope * x_line + intercept
-        plt.plot(x_line, y_line, 'r--', linewidth=2,
-                 label=f'Trend (R² = {r_value**2:.3f})')
+            x_line = np.array([valid['usage_pct'].min(), valid['usage_pct'].max()])
+            y_line = slope * x_line + intercept
+            plt.plot(x_line, y_line, 'r--', linewidth=2,
+                     label=f'Trend (R² = {r_value**2:.3f})')
+        except (ValueError, FloatingPointError):
+            pass  # Skip trend line if regression fails
 
     plt.title('Temperature vs CPU Usage')
     plt.xlabel('CPU Usage (%)')
     plt.ylabel(f'Temperature ({unit})')
     plt.grid(True, linestyle='--', alpha=0.4)
-    if len(valid) > 2:
+    # Only show legend if trend line was added
+    if plt.gca().get_legend_handles_labels()[0]:
         plt.legend(loc='lower right')
     plt.tight_layout()
 
