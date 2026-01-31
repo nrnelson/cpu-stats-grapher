@@ -14,6 +14,12 @@ Features:
 - Power consumption tracking (socket + CCD breakdown)
 - Temperature vs CPU usage correlation
 - Temperature distribution histogram
+- CPU usage timeline (fallback when no temperature data)
+
+Graceful Degradation:
+- Detects available data columns and generates only applicable graphs
+- Falls back to numpy for correlation if scipy unavailable
+- Generates usage timeline if no temperature data available
 
 Usage:
     python cpu-stats-grapher.py logfile.log [OPTIONS]
@@ -31,7 +37,13 @@ import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from scipy import stats
+
+# Optional scipy import for correlation analysis
+try:
+    from scipy import stats as scipy_stats
+    SCIPY_AVAILABLE = True
+except ImportError:
+    SCIPY_AVAILABLE = False
 
 
 def parse_args():
@@ -67,6 +79,62 @@ def c_to_f(celsius: float) -> float:
     return celsius * 9 / 5 + 32
 
 
+def detect_available_data(df: pd.DataFrame) -> dict:
+    """
+    Detect which data columns are available and have sufficient valid data.
+
+    Returns dict with boolean flags for each data type.
+    """
+    available = {
+        'temperature': False,
+        'usage': False,
+        'power': False,
+        'power_ccd': False,
+        'clocks': False,
+    }
+
+    # Check temperature (need >10% valid data)
+    if 'temp_c' in df.columns:
+        temp = pd.to_numeric(df['temp_c'], errors='coerce')
+        valid_ratio = temp.notna().sum() / len(df)
+        available['temperature'] = valid_ratio > 0.1
+
+    # Check usage
+    if 'usage_pct' in df.columns:
+        usage = df['usage_pct']
+        if pd.api.types.is_string_dtype(usage):
+            usage = usage.str.rstrip('%')
+        usage = pd.to_numeric(usage, errors='coerce')
+        valid_ratio = usage.notna().sum() / len(df)
+        available['usage'] = valid_ratio > 0.1
+
+    # Check power
+    if 'power_w' in df.columns:
+        power = pd.to_numeric(df['power_w'], errors='coerce')
+        valid_ratio = power.notna().sum() / len(df)
+        available['power'] = valid_ratio > 0.1
+
+    # Check CCD power breakdown
+    if 'ccd0_w' in df.columns and 'ccd1_w' in df.columns:
+        ccd0 = pd.to_numeric(df['ccd0_w'], errors='coerce')
+        ccd1 = pd.to_numeric(df['ccd1_w'], errors='coerce')
+        # Need at least one CCD with valid data
+        available['power_ccd'] = (ccd0.notna().sum() / len(df) > 0.1 or
+                                   ccd1.notna().sum() / len(df) > 0.1)
+
+    # Check clocks (any core*_mhz columns with valid data)
+    core_cols = [c for c in df.columns if c.startswith('core') and c.endswith('_mhz')]
+    if core_cols:
+        # Check if at least one core has valid data
+        for col in core_cols:
+            clocks = pd.to_numeric(df[col], errors='coerce')
+            if clocks.notna().sum() / len(df) > 0.1:
+                available['clocks'] = True
+                break
+
+    return available
+
+
 def load_data(filepath: Path) -> pd.DataFrame:
     """Load and clean the temperature log file."""
     if not filepath.exists():
@@ -87,24 +155,70 @@ def load_data(filepath: Path) -> pd.DataFrame:
     first_col = df.columns[0].lower()
 
     # Parse datetime - handle both "YYYY-MM-DD HH:MM:SS" combined and separate columns
-    if 'timestamp' in first_col or len(df.columns) >= 6:
+    if 'timestamp' in first_col or len(df.columns) >= 3:
         # Data appears to have date and time as separate values in first two data positions
         # Re-read with proper handling
         df = pd.read_csv(filepath, sep=r'\s+', engine='python', skiprows=1, header=None)
 
-        # Detect format: old (38 cols) vs new with power (41 cols)
-        # Old: date, time, temp_c, load_avg, usage_pct, throttled, core0-31_mhz (6 + 32 = 38)
-        # New: date, time, temp_c, load_avg, usage_pct, throttled, power_w, ccd0_w, ccd1_w, core0-31_mhz (9 + 32 = 41)
-        num_cols = len(df.columns)
-        core_cols = [f'core{i}_mhz' for i in range(32)]
+        # Get header to determine column layout
+        with open(filepath, 'r') as f:
+            header_line = f.readline().strip()
+        header_cols = header_line.split('\t')
 
-        if num_cols >= 41:
-            # New format with power columns
-            df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct', 'throttled',
-                          'power_w', 'ccd0_w', 'ccd1_w'] + core_cols
+        # Determine format based on header
+        # New format always has timestamp, load_avg, usage_pct as first 3 columns
+        # Then optional: temp_c, power_w, ccd0_w, ccd1_w, core*_mhz
+
+        num_data_cols = len(df.columns)
+        core_count = 0
+
+        # Count core columns in header
+        for col in header_cols:
+            if col.startswith('core') and col.endswith('_mhz'):
+                core_count += 1
+
+        # Build column names based on header
+        col_names = ['date', 'time']
+        header_idx = 1  # Skip 'timestamp' which becomes date+time
+
+        for col in header_cols[1:]:  # Skip timestamp
+            if col.startswith('core') and col.endswith('_mhz'):
+                col_names.append(col)
+            else:
+                col_names.append(col)
+
+        # Adjust for actual data columns (date and time are split)
+        if len(col_names) == num_data_cols:
+            df.columns = col_names
         else:
-            # Old format without power columns
-            df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct', 'throttled'] + core_cols
+            # Fallback: try to detect format by column count
+            core_cols = [f'core{i}_mhz' for i in range(32)]
+
+            # Check various formats
+            if num_data_cols >= 40:
+                # Full format with power and CCD
+                df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct',
+                              'power_w', 'ccd0_w', 'ccd1_w'] + core_cols[:num_data_cols - 8]
+            elif num_data_cols >= 37:
+                # Old format without power
+                df.columns = ['date', 'time', 'temp_c', 'load_avg', 'usage_pct'] + core_cols[:num_data_cols - 5]
+            elif 'temp_c' in header_cols:
+                # Has temperature
+                base_cols = ['date', 'time', 'load_avg', 'usage_pct']
+                if 'temp_c' in header_cols:
+                    base_cols.append('temp_c')
+                if 'power_w' in header_cols:
+                    if 'ccd0_w' in header_cols:
+                        base_cols.extend(['power_w', 'ccd0_w', 'ccd1_w'])
+                    else:
+                        base_cols.append('power_w')
+                remaining = num_data_cols - len(base_cols)
+                df.columns = base_cols + core_cols[:remaining]
+            else:
+                # Minimal format: timestamp, load_avg, usage_pct + optional columns
+                base_cols = ['date', 'time', 'load_avg', 'usage_pct']
+                remaining = num_data_cols - len(base_cols)
+                df.columns = base_cols + core_cols[:remaining]
 
         # Combine date and time
         df['datetime'] = pd.to_datetime(df['date'] + ' ' + df['time'], format='%Y-%m-%d %H:%M:%S')
@@ -114,17 +228,18 @@ def load_data(filepath: Path) -> pd.DataFrame:
     df.set_index('datetime', inplace=True)
 
     # Clean numeric columns
-    df['temp_c'] = pd.to_numeric(df['temp_c'], errors='coerce')
-    df['load_avg'] = pd.to_numeric(df['load_avg'], errors='coerce')
+    if 'temp_c' in df.columns:
+        df['temp_c'] = pd.to_numeric(df['temp_c'], errors='coerce')
+
+    if 'load_avg' in df.columns:
+        df['load_avg'] = pd.to_numeric(df['load_avg'], errors='coerce')
 
     # Strip % from usage_pct and convert to numeric
-    if pd.api.types.is_string_dtype(df['usage_pct']):
-        df['usage_pct'] = df['usage_pct'].str.rstrip('%').astype(float)
-    else:
-        df['usage_pct'] = pd.to_numeric(df['usage_pct'], errors='coerce')
-
-    # Convert throttled to boolean
-    df['throttled'] = df['throttled'] != '-'
+    if 'usage_pct' in df.columns:
+        if pd.api.types.is_string_dtype(df['usage_pct']):
+            df['usage_pct'] = df['usage_pct'].str.rstrip('%').astype(float)
+        else:
+            df['usage_pct'] = pd.to_numeric(df['usage_pct'], errors='coerce')
 
     # Parse power columns if present (convert "-" to NaN)
     for power_col in ['power_w', 'ccd0_w', 'ccd1_w']:
@@ -143,87 +258,115 @@ def load_data(filepath: Path) -> pd.DataFrame:
     return df
 
 
-def compute_statistics(df: pd.DataFrame, tjmax: float, use_fahrenheit: bool = False) -> dict:
+def compute_statistics(df: pd.DataFrame, tjmax: float, use_fahrenheit: bool = False,
+                       available: dict | None = None) -> dict:
     """Compute comprehensive statistics from the data."""
-    temp = df['temp_c'].dropna()
+    if available is None:
+        available = detect_available_data(df)
+
     duration = (df.index[-1] - df.index[0]).total_seconds()
-
-    # Thresholds in Celsius for calculations
-    thresh_85 = 85
-    thresh_90 = 90
-
-    # Calculate stats in Celsius first
-    temp_min = temp.min()
-    temp_max = temp.max()
-    temp_mean = temp.mean()
-    temp_std = temp.std()
-    temp_median = temp.median()
-    headroom = tjmax - temp_max
-
-    # Convert to Fahrenheit if requested
-    if use_fahrenheit:
-        temp_min = c_to_f(temp_min)
-        temp_max = c_to_f(temp_max)
-        temp_mean = c_to_f(temp_mean)
-        temp_std = temp_std * 9 / 5  # Std dev scales differently
-        temp_median = c_to_f(temp_median)
-        headroom = headroom * 9 / 5  # Delta scales by ratio only
 
     stats_dict = {
         'duration_min': duration / 60,
-        'samples': len(temp),
-        'temp_min': temp_min,
-        'temp_max': temp_max,
-        'temp_mean': temp_mean,
-        'temp_std': temp_std,
-        'temp_median': temp_median,
-        'time_above_85': (temp > thresh_85).sum() / len(temp) * 100,
-        'time_above_90': (temp > thresh_90).sum() / len(temp) * 100,
-        'time_above_tjmax': (temp > tjmax).sum() / len(temp) * 100,
-        'headroom': headroom,
+        'samples': len(df),
     }
 
+    # Temperature stats (only if available)
+    if available['temperature']:
+        temp = df['temp_c'].dropna()
+
+        # Thresholds in Celsius for calculations
+        thresh_85 = 85
+        thresh_90 = 90
+
+        # Calculate stats in Celsius first
+        temp_min = temp.min()
+        temp_max = temp.max()
+        temp_mean = temp.mean()
+        temp_std = temp.std()
+        temp_median = temp.median()
+        headroom = tjmax - temp_max
+
+        # Convert to Fahrenheit if requested
+        if use_fahrenheit:
+            temp_min = c_to_f(temp_min)
+            temp_max = c_to_f(temp_max)
+            temp_mean = c_to_f(temp_mean)
+            temp_std = temp_std * 9 / 5  # Std dev scales differently
+            temp_median = c_to_f(temp_median)
+            headroom = headroom * 9 / 5  # Delta scales by ratio only
+
+        stats_dict.update({
+            'temp_min': temp_min,
+            'temp_max': temp_max,
+            'temp_mean': temp_mean,
+            'temp_std': temp_std,
+            'temp_median': temp_median,
+            'time_above_85': (df['temp_c'].dropna() > thresh_85).sum() / len(temp) * 100,
+            'time_above_90': (df['temp_c'].dropna() > thresh_90).sum() / len(temp) * 100,
+            'time_above_tjmax': (df['temp_c'].dropna() > tjmax).sum() / len(temp) * 100,
+            'headroom': headroom,
+        })
+
     # Load/Usage stats
-    if 'usage_pct' in df.columns:
+    if available['usage']:
         usage = df['usage_pct'].dropna()
         stats_dict['usage_mean'] = usage.mean()
         stats_dict['usage_max'] = usage.max()
+        stats_dict['usage_min'] = usage.min()
+
+    # Load average stats
+    if 'load_avg' in df.columns:
+        load = df['load_avg'].dropna()
+        if len(load) > 0:
+            stats_dict['load_mean'] = load.mean()
+            stats_dict['load_max'] = load.max()
 
     # Clock speed stats
-    if 'avg_clock_mhz' in df.columns:
+    if available['clocks'] and 'avg_clock_mhz' in df.columns:
         clocks = df['avg_clock_mhz'].dropna()
         stats_dict['clock_mean'] = clocks.mean()
         stats_dict['clock_min'] = clocks.min()
         stats_dict['clock_max'] = clocks.max()
         stats_dict['clock_std'] = clocks.std()
 
-    # Correlation between temp and usage
-    if 'usage_pct' in df.columns:
+    # Correlation between temp and usage (only if both available)
+    if available['temperature'] and available['usage']:
         valid = df[['temp_c', 'usage_pct']].dropna()
         if len(valid) > 2:
-            r, p = stats.pearsonr(valid['temp_c'], valid['usage_pct'])
-            stats_dict['temp_usage_corr'] = r
-            stats_dict['temp_usage_pval'] = p
+            if SCIPY_AVAILABLE:
+                r, p = scipy_stats.pearsonr(valid['temp_c'], valid['usage_pct'])
+                stats_dict['temp_usage_corr'] = r
+                stats_dict['temp_usage_pval'] = p
+            else:
+                # Numpy fallback for correlation
+                r = np.corrcoef(valid['temp_c'], valid['usage_pct'])[0, 1]
+                stats_dict['temp_usage_corr'] = r
+                stats_dict['temp_usage_pval'] = None  # Can't compute p-value without scipy
 
     # Power stats (if available)
-    if 'power_w' in df.columns:
+    if available['power']:
         power = df['power_w'].dropna()
         if len(power) > 0:
             stats_dict['power_mean'] = power.mean()
             stats_dict['power_max'] = power.max()
             stats_dict['power_min'] = power.min()
 
-    if 'ccd0_w' in df.columns and 'ccd1_w' in df.columns:
-        ccd0 = df['ccd0_w'].dropna()
-        ccd1 = df['ccd1_w'].dropna()
-        if len(ccd0) > 0 and len(ccd1) > 0:
-            stats_dict['ccd0_mean'] = ccd0.mean()
-            stats_dict['ccd1_mean'] = ccd1.mean()
+    if available['power_ccd']:
+        if 'ccd0_w' in df.columns:
+            ccd0 = df['ccd0_w'].dropna()
+            if len(ccd0) > 0:
+                stats_dict['ccd0_mean'] = ccd0.mean()
+        if 'ccd1_w' in df.columns:
+            ccd1 = df['ccd1_w'].dropna()
+            if len(ccd1) > 0:
+                stats_dict['ccd1_mean'] = ccd1.mean()
 
     return stats_dict
 
 
-def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = False):
+def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = False,
+                     available: dict | None = None):
     """Print formatted statistics to console."""
     unit = "°F" if use_fahrenheit else "°C"
     # Display thresholds in appropriate unit
@@ -231,24 +374,26 @@ def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = Fals
     thresh_90 = c_to_f(90) if use_fahrenheit else 90
 
     print("\n" + "=" * 60)
-    print("CPU TEMPERATURE ANALYSIS SUMMARY")
+    print("CPU ANALYSIS SUMMARY")
     print("=" * 60)
 
     print(f"\n{'Duration:':<25} {stats_dict['duration_min']:.1f} minutes ({stats_dict['samples']} samples)")
 
-    print(f"\n{'--- Temperature Stats ---':^60}")
-    print(f"{'  Min:':<25} {stats_dict['temp_min']:.2f}{unit}")
-    print(f"{'  Max:':<25} {stats_dict['temp_max']:.2f}{unit}")
-    print(f"{'  Mean:':<25} {stats_dict['temp_mean']:.2f}{unit}")
-    print(f"{'  Std Dev:':<25} {stats_dict['temp_std']:.2f}{unit}")
-    print(f"{'  Median:':<25} {stats_dict['temp_median']:.2f}{unit}")
+    # Temperature stats (only if available)
+    if 'temp_mean' in stats_dict:
+        print(f"\n{'--- Temperature Stats ---':^60}")
+        print(f"{'  Min:':<25} {stats_dict['temp_min']:.2f}{unit}")
+        print(f"{'  Max:':<25} {stats_dict['temp_max']:.2f}{unit}")
+        print(f"{'  Mean:':<25} {stats_dict['temp_mean']:.2f}{unit}")
+        print(f"{'  Std Dev:':<25} {stats_dict['temp_std']:.2f}{unit}")
+        print(f"{'  Median:':<25} {stats_dict['temp_median']:.2f}{unit}")
 
-    print(f"\n{'--- Thermal Headroom ---':^60}")
-    print(f"{'  TJMax:':<25} {tjmax:.0f}{unit}")
-    print(f"{'  Headroom (TJMax - Max):':<25} {stats_dict['headroom']:.2f}{unit}")
-    print(f"{'  Time above {thresh_85:.0f}{unit}:':<25} {stats_dict['time_above_85']:.1f}%")
-    print(f"{'  Time above {thresh_90:.0f}{unit}:':<25} {stats_dict['time_above_90']:.1f}%")
-    print(f"{'  Time above TJMax:':<25} {stats_dict['time_above_tjmax']:.1f}%")
+        print(f"\n{'--- Thermal Headroom ---':^60}")
+        print(f"{'  TJMax:':<25} {tjmax:.0f}{unit}")
+        print(f"{'  Headroom (TJMax - Max):':<25} {stats_dict['headroom']:.2f}{unit}")
+        print(f"{'  Time above {thresh_85:.0f}{unit}:':<25} {stats_dict['time_above_85']:.1f}%")
+        print(f"{'  Time above {thresh_90:.0f}{unit}:':<25} {stats_dict['time_above_90']:.1f}%")
+        print(f"{'  Time above TJMax:':<25} {stats_dict['time_above_tjmax']:.1f}%")
 
     if 'clock_mean' in stats_dict:
         print(f"\n{'--- Clock Speed Stats ---':^60}")
@@ -260,13 +405,21 @@ def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = Fals
     if 'usage_mean' in stats_dict:
         print(f"\n{'--- CPU Usage Stats ---':^60}")
         print(f"{'  Mean Usage:':<25} {stats_dict['usage_mean']:.1f}%")
+        print(f"{'  Min Usage:':<25} {stats_dict['usage_min']:.1f}%")
         print(f"{'  Max Usage:':<25} {stats_dict['usage_max']:.1f}%")
+
+    if 'load_mean' in stats_dict:
+        print(f"{'  Mean Load (1m avg):':<25} {stats_dict['load_mean']:.2f}")
+        print(f"{'  Max Load (1m avg):':<25} {stats_dict['load_max']:.2f}")
 
     if 'temp_usage_corr' in stats_dict:
         print(f"\n{'--- Correlation ---':^60}")
         print(f"{'  Temp vs Usage (r):':<25} {stats_dict['temp_usage_corr']:.3f}")
-        sig = "significant" if stats_dict['temp_usage_pval'] < 0.05 else "not significant"
-        print(f"{'  P-value:':<25} {stats_dict['temp_usage_pval']:.2e} ({sig})")
+        if stats_dict['temp_usage_pval'] is not None:
+            sig = "significant" if stats_dict['temp_usage_pval'] < 0.05 else "not significant"
+            print(f"{'  P-value:':<25} {stats_dict['temp_usage_pval']:.2e} ({sig})")
+        else:
+            print(f"{'  P-value:':<25} N/A (scipy not installed)")
 
     if 'power_mean' in stats_dict:
         print(f"\n{'--- Power Stats ---':^60}")
@@ -275,6 +428,7 @@ def print_statistics(stats_dict: dict, tjmax: float, use_fahrenheit: bool = Fals
         print(f"{'  Max Power:':<25} {stats_dict['power_max']:.1f} W")
         if 'ccd0_mean' in stats_dict:
             print(f"{'  CCD0 Mean:':<25} {stats_dict['ccd0_mean']:.1f} W")
+        if 'ccd1_mean' in stats_dict:
             print(f"{'  CCD1 Mean:':<25} {stats_dict['ccd1_mean']:.1f} W")
 
     print("\n" + "=" * 60)
@@ -365,7 +519,70 @@ def plot_temperature_timeline(df: pd.DataFrame, resample: str, tjmax: float,
     print(f"Saved: {output_path}")
 
 
-def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str, use_fahrenheit: bool = False):
+def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, output_path: str):
+    """Create CPU usage timeline with load average overlay (fallback when no temp data)."""
+    fig, ax1 = plt.subplots(figsize=(14, 7))
+
+    # Resample for smoothing
+    usage_resampled = df['usage_pct'].resample(resample)
+    usage_mean = usage_resampled.mean()
+    usage_min = usage_resampled.min()
+    usage_max = usage_resampled.max()
+
+    # Plot usage envelope
+    ax1.fill_between(usage_mean.index, usage_min.values, usage_max.values,
+                     alpha=0.3, color='tab:blue', label='Min/Max Range')
+
+    # Plot mean usage line
+    ax1.plot(usage_mean.index, usage_mean.values,
+             color='tab:blue', linewidth=2, label=f'CPU Usage ({resample} avg)')
+
+    ax1.set_xlabel('Time')
+    ax1.set_ylabel('CPU Usage (%)', color='tab:blue')
+    ax1.tick_params(axis='y', labelcolor='tab:blue')
+    ax1.set_ylim(0, 105)  # 0-100% with small margin
+
+    # Load average on secondary axis
+    if 'load_avg' in df.columns:
+        load_resampled = df['load_avg'].resample(resample).mean()
+
+        ax2 = ax1.twinx()
+        ax2.plot(load_resampled.index, load_resampled.values,
+                 color='tab:orange', linewidth=2, alpha=0.7, label='Load Avg (1m)')
+        ax2.set_ylabel('Load Average', color='tab:orange')
+        ax2.tick_params(axis='y', labelcolor='tab:orange')
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+    else:
+        ax1.legend(loc='lower right')
+
+    # Stats annotation box
+    stats_text = f"Mean: {stats_dict.get('usage_mean', 0):.1f}%\n"
+    stats_text += f"Max: {stats_dict.get('usage_max', 0):.1f}%"
+    if 'load_mean' in stats_dict:
+        stats_text += f"\nLoad Avg: {stats_dict['load_mean']:.2f}"
+    plt.annotate(stats_text, xy=(0.02, 0.98), xycoords='axes fraction',
+                 fontsize=10, verticalalignment='top',
+                 bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+
+    # Formatting
+    ax1.xaxis.set_major_locator(get_time_locator(df))
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax1.grid(True, linestyle='--', alpha=0.4)
+
+    plt.title('CPU Usage Over Time')
+    plt.gcf().autofmt_xdate()
+    fig.tight_layout()
+
+    plt.savefig(output_path, dpi=150)
+    print(f"Saved: {output_path}")
+
+
+def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
+                        use_fahrenheit: bool = False, has_temp: bool = True):
     """Create clock speed analysis with temperature overlay."""
     if 'avg_clock_mhz' not in df.columns:
         print("Skipping clock analysis: no clock data found")
@@ -376,9 +593,6 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str, use_f
 
     # Resample
     clock_resampled = df['avg_clock_mhz'].resample(resample).mean()
-    temp_resampled = df['temp_c'].resample(resample).mean()
-    if use_fahrenheit:
-        temp_resampled = temp_resampled.apply(c_to_f)
     usage_resampled = df['usage_pct'].resample(resample).mean() if 'usage_pct' in df.columns else None
 
     # Clock speed on primary axis
@@ -392,13 +606,38 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str, use_f
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
     ax1.grid(True, linestyle='--', alpha=0.4)
 
-    # Temperature on secondary axis
-    ax2 = ax1.twinx()
-    color2 = 'tab:red'
-    ax2.set_ylabel(f'Temperature ({unit})', color=color2)
-    ax2.plot(temp_resampled.index, temp_resampled.values,
-             color=color2, linewidth=2, alpha=0.7, label='Temperature')
-    ax2.tick_params(axis='y', labelcolor=color2)
+    # Temperature on secondary axis (if available)
+    if has_temp and 'temp_c' in df.columns:
+        temp_resampled = df['temp_c'].resample(resample).mean()
+        if use_fahrenheit:
+            temp_resampled = temp_resampled.apply(c_to_f)
+
+        ax2 = ax1.twinx()
+        color2 = 'tab:red'
+        ax2.set_ylabel(f'Temperature ({unit})', color=color2)
+        ax2.plot(temp_resampled.index, temp_resampled.values,
+                 color=color2, linewidth=2, alpha=0.7, label='Temperature')
+        ax2.tick_params(axis='y', labelcolor=color2)
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+    else:
+        # Without temperature, show usage instead
+        if usage_resampled is not None:
+            ax2 = ax1.twinx()
+            color2 = 'tab:green'
+            ax2.set_ylabel('CPU Usage (%)', color=color2)
+            ax2.plot(usage_resampled.index, usage_resampled.values,
+                     color=color2, linewidth=2, alpha=0.7, label='CPU Usage')
+            ax2.tick_params(axis='y', labelcolor=color2)
+
+            lines1, labels1 = ax1.get_legend_handles_labels()
+            lines2, labels2 = ax2.get_legend_handles_labels()
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+        else:
+            ax1.legend(loc='lower right')
 
     # Highlight potential throttling: high CPU usage (>80%) but clocks below peak
     max_clock = clock_resampled.max()
@@ -417,11 +656,6 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str, use_f
                          label='Potential Throttling')
 
     plt.title('Clock Speed Analysis')
-
-    # Combined legend
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
 
     plt.gcf().autofmt_xdate()
     fig.tight_layout()
@@ -452,8 +686,15 @@ def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool =
 
     # Trend line
     if len(valid) > 2:
-        slope, intercept, r_value, p_value, std_err = stats.linregress(
-            valid['usage_pct'], valid['temp_c'])
+        if SCIPY_AVAILABLE:
+            slope, intercept, r_value, p_value, std_err = scipy_stats.linregress(
+                valid['usage_pct'], valid['temp_c'])
+        else:
+            # Numpy fallback
+            coeffs = np.polyfit(valid['usage_pct'], valid['temp_c'], 1)
+            slope, intercept = coeffs
+            r_value = np.corrcoef(valid['usage_pct'], valid['temp_c'])[0, 1]
+
         x_line = np.array([valid['usage_pct'].min(), valid['usage_pct'].max()])
         y_line = slope * x_line + intercept
         plt.plot(x_line, y_line, 'r--', linewidth=2,
@@ -533,7 +774,9 @@ def plot_temp_histogram(df: pd.DataFrame, tjmax: float, stats_dict: dict, output
     print(f"Saved: {output_path}")
 
 
-def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str, use_fahrenheit: bool = False):
+def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
+                        use_fahrenheit: bool = False, has_temp: bool = True,
+                        has_ccd: bool = True):
     """Create power analysis chart with temperature overlay."""
     if 'power_w' not in df.columns:
         print("Skipping power analysis: no power data found")
@@ -549,15 +792,13 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str, use_f
 
     # Resample
     power_resampled = df['power_w'].resample(resample).mean()
-    temp_resampled = df['temp_c'].resample(resample).mean()
-    if use_fahrenheit:
-        temp_resampled = temp_resampled.apply(c_to_f)
 
     # Check for CCD data
-    has_ccd = 'ccd0_w' in df.columns and 'ccd1_w' in df.columns
-    if has_ccd:
+    if has_ccd and 'ccd0_w' in df.columns and 'ccd1_w' in df.columns:
         ccd0_resampled = df['ccd0_w'].resample(resample).mean()
         ccd1_resampled = df['ccd1_w'].resample(resample).mean()
+    else:
+        has_ccd = False
 
     # Power on primary axis
     color1 = 'tab:green'
@@ -577,20 +818,27 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str, use_f
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
     ax1.grid(True, linestyle='--', alpha=0.4)
 
-    # Temperature on secondary axis
-    ax2 = ax1.twinx()
-    color2 = 'tab:red'
-    ax2.set_ylabel(f'Temperature ({unit})', color=color2)
-    ax2.plot(temp_resampled.index, temp_resampled.values,
-             color=color2, linewidth=2, alpha=0.7, label='Temperature')
-    ax2.tick_params(axis='y', labelcolor=color2)
+    # Temperature on secondary axis (if available)
+    if has_temp and 'temp_c' in df.columns:
+        temp_resampled = df['temp_c'].resample(resample).mean()
+        if use_fahrenheit:
+            temp_resampled = temp_resampled.apply(c_to_f)
+
+        ax2 = ax1.twinx()
+        color2 = 'tab:red'
+        ax2.set_ylabel(f'Temperature ({unit})', color=color2)
+        ax2.plot(temp_resampled.index, temp_resampled.values,
+                 color=color2, linewidth=2, alpha=0.7, label='Temperature')
+        ax2.tick_params(axis='y', labelcolor=color2)
+
+        # Combined legend
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+    else:
+        ax1.legend(loc='lower right')
 
     plt.title('Power Consumption Analysis')
-
-    # Combined legend
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
 
     plt.gcf().autofmt_xdate()
     fig.tight_layout()
@@ -607,34 +855,82 @@ def main():
     df = load_data(args.input)
     print(f"Loaded {len(df)} samples from: {args.input}")
 
+    # Detect available data
+    available = detect_available_data(df)
+
+    # Print data availability
+    print("\nData availability:")
+    print(f"  Temperature: {'Yes' if available['temperature'] else 'No'}")
+    print(f"  CPU Usage:   {'Yes' if available['usage'] else 'No'}")
+    print(f"  Power:       {'Yes' if available['power'] else 'No'}")
+    print(f"  Power CCD:   {'Yes' if available['power_ccd'] else 'No'}")
+    print(f"  Clocks:      {'Yes' if available['clocks'] else 'No'}")
+
+    if not SCIPY_AVAILABLE:
+        print("\nNote: scipy not installed, using numpy for correlation (no p-values)")
+
     # Convert tjmax if using Fahrenheit
     tjmax_display = c_to_f(args.tjmax) if use_f else args.tjmax
 
     # Compute and print statistics
-    stats_dict = compute_statistics(df, args.tjmax, use_f)
-    print_statistics(stats_dict, tjmax_display, use_f)
+    stats_dict = compute_statistics(df, args.tjmax, use_f, available)
+    print_statistics(stats_dict, tjmax_display, use_f, available)
 
-    # Generate plots
+    # Generate plots based on available data
     print("\nGenerating visualizations...")
 
-    output_files = [
-        f"{args.output}_temp.png",
-        f"{args.output}_clocks.png",
-        f"{args.output}_correlation.png",
-        f"{args.output}_histogram.png",
-    ]
+    output_files = []
 
-    plot_temperature_timeline(df, args.resample, args.tjmax, stats_dict, output_files[0], use_f)
-    plot_clock_analysis(df, args.resample, output_files[1], use_f)
-    plot_temp_vs_load(df, output_files[2], use_f)
-    plot_temp_histogram(df, args.tjmax, stats_dict, output_files[3], use_f)
+    # Temperature timeline (requires temperature)
+    if available['temperature']:
+        output_path = f"{args.output}_temp.png"
+        plot_temperature_timeline(df, args.resample, args.tjmax, stats_dict, output_path, use_f)
+        output_files.append(output_path)
+    else:
+        print("Skipping temperature timeline: no temperature data")
 
-    # Power analysis (only if power data is present)
-    power_output = f"{args.output}_power.png"
-    if plot_power_analysis(df, args.resample, power_output, use_f):
-        output_files.append(power_output)
+    # Usage timeline (fallback when no temperature, or always available)
+    if available['usage']:
+        output_path = f"{args.output}_usage.png"
+        plot_usage_timeline(df, args.resample, stats_dict, output_path)
+        output_files.append(output_path)
 
-    print("\nAnalysis complete!")
+    # Clock analysis (requires clocks)
+    if available['clocks']:
+        output_path = f"{args.output}_clocks.png"
+        plot_clock_analysis(df, args.resample, output_path, use_f, available['temperature'])
+        output_files.append(output_path)
+    else:
+        print("Skipping clock analysis: no clock data")
+
+    # Correlation plot (requires temperature + usage)
+    if available['temperature'] and available['usage']:
+        output_path = f"{args.output}_correlation.png"
+        plot_temp_vs_load(df, output_path, use_f)
+        output_files.append(output_path)
+    else:
+        print("Skipping correlation plot: requires both temperature and usage data")
+
+    # Histogram (requires temperature)
+    if available['temperature']:
+        output_path = f"{args.output}_histogram.png"
+        plot_temp_histogram(df, args.tjmax, stats_dict, output_path, use_f)
+        output_files.append(output_path)
+    else:
+        print("Skipping temperature histogram: no temperature data")
+
+    # Power analysis (requires power)
+    if available['power']:
+        output_path = f"{args.output}_power.png"
+        if plot_power_analysis(df, args.resample, output_path, use_f,
+                                available['temperature'], available['power_ccd']):
+            output_files.append(output_path)
+
+    if not output_files:
+        print("\nWarning: No graphs could be generated - insufficient data")
+        sys.exit(1)
+
+    print(f"\nAnalysis complete! Generated {len(output_files)} graph(s).")
 
     # Open images with default viewer
     if args.open:
