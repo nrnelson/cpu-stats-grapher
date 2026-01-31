@@ -505,6 +505,13 @@ if $COLLECT_POWER; then
     FIRST_POWER_READING=true
 fi
 
+# Align to next interval boundary before starting loop to avoid duplicate timestamps
+if [[ -n "$EPOCHREALTIME" ]]; then
+    sleep $(awk -v now="$EPOCHREALTIME" -v interval="$POLL_INTERVAL" 'BEGIN {printf "%.6f", interval - (now % interval)}')
+else
+    sleep $(date +%s.%N | awk -v interval="$POLL_INTERVAL" '{print interval - ($1 % interval)}')
+fi
+
 # Main collection loop
 while true; do
     # 1. Get Time (using bash builtin - much faster than date command)
