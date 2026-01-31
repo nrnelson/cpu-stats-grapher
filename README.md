@@ -234,31 +234,36 @@ Install scipy for full functionality: `pip install scipy`
 
 ## Data Format
 
-The logger outputs tab-separated values. The columns vary based on available/requested metrics:
+The logger outputs tab-separated values. The header shows `timestamp` but the data has separate `date` and `time` columns. Columns vary based on available/requested metrics:
 
 **Always included:**
 ```
-timestamp  load_avg  usage_pct
+date        time      load_avg  usage_pct
+2026-01-31  17:15:53  0.14      0%
 ```
 
 **With temperature (`-t`):**
 ```
-timestamp  load_avg  usage_pct  temp_c
+date        time      load_avg  usage_pct  temp_c
+2026-01-31  17:15:53  0.14      0%         50.1
 ```
 
 **With power (`-p`, AMD with CCD):**
 ```
-timestamp  load_avg  usage_pct  power_w  ccd0_w  ccd1_w
+date        time      load_avg  usage_pct  power_w  ccd0_w  ccd1_w
+2026-01-31  17:15:53  0.14      0%         38.9     0.2     0.7
 ```
 
 **With power (`-p`, Intel/RAPL):**
 ```
-timestamp  load_avg  usage_pct  power_w
+date        time      load_avg  usage_pct  power_w
+2026-01-31  17:15:53  0.14      0%         38.9
 ```
 
 **With clocks (`-c`):**
 ```
-timestamp  load_avg  usage_pct  core0_mhz  core1_mhz  ...
+date        time      load_avg  usage_pct  core0_mhz  core1_mhz  ...
+2026-01-31  17:15:53  0.14      0%         3640       621        ...
 ```
 
 The grapher auto-detects the format and generates appropriate visualizations.
