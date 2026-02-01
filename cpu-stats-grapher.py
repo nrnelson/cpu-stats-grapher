@@ -484,13 +484,14 @@ def plot_temperature_timeline(df: pd.DataFrame, resample: str, tjmax: float,
     ax = plt.gca()
     ax.xaxis.set_major_locator(get_time_locator(df))
     ax.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax.margins(x=0)  # Remove horizontal padding
     plt.gcf().autofmt_xdate()
 
     plt.title('CPU Temperature Over Time')
     plt.xlabel('Time')
     plt.ylabel(f'Temperature ({unit})')
     plt.grid(True, linestyle='--', alpha=0.4)
-    plt.legend(loc='lower right')
+    plt.legend(loc='upper right')
     plt.tight_layout()
 
     plt.savefig(output_path, dpi=150)
@@ -533,7 +534,7 @@ def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, outpu
         # Combined legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
     else:
         ax1.legend(loc='lower right')
 
@@ -549,6 +550,7 @@ def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, outpu
     # Formatting
     ax1.xaxis.set_major_locator(get_time_locator(df))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax1.margins(x=0)  # Remove horizontal padding
     ax1.grid(True, linestyle='--', alpha=0.4)
 
     plt.title('CPU Usage Over Time')
@@ -582,6 +584,7 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.xaxis.set_major_locator(get_time_locator(df))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax1.margins(x=0)  # Remove horizontal padding
     ax1.grid(True, linestyle='--', alpha=0.4)
 
     # Temperature on secondary axis (if available)
@@ -600,7 +603,7 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
         # Combined legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
     else:
         # Without temperature, show usage instead
         if usage_resampled is not None:
@@ -613,7 +616,7 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
 
             lines1, labels1 = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+            ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
         else:
             ax1.legend(loc='lower right')
 
@@ -688,7 +691,12 @@ def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool =
     plt.grid(True, linestyle='--', alpha=0.4)
     # Only show legend if trend line was added
     if plt.gca().get_legend_handles_labels()[0]:
-        plt.legend(loc='lower right')
+        plt.legend(loc='upper right')
+
+    # Use small margin so edge points aren't clipped against axis
+    ax = plt.gca()
+    ax.margins(0.02)
+
     plt.tight_layout()
 
     plt.savefig(output_path, dpi=150)
@@ -751,6 +759,11 @@ def plot_temp_histogram(df: pd.DataFrame, tjmax: float, stats_dict: dict, output
     plt.ylabel('Frequency')
     plt.legend(loc='upper right')
     plt.grid(True, linestyle='--', alpha=0.4, axis='y')
+
+    # Set x-axis limits to histogram bin range (remove margins)
+    ax = plt.gca()
+    ax.set_xlim(bins[0], bins[-1])
+
     plt.tight_layout()
 
     plt.savefig(output_path, dpi=150)
@@ -799,6 +812,7 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
     ax1.tick_params(axis='y', labelcolor=color1)
     ax1.xaxis.set_major_locator(get_time_locator(df))
     ax1.xaxis.set_major_formatter(mdates.DateFormatter('%H:%M:%S'))
+    ax1.margins(x=0)  # Remove horizontal padding
     ax1.grid(True, linestyle='--', alpha=0.4)
 
     # Temperature on secondary axis (if available)
@@ -817,7 +831,7 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
         # Combined legend
         lines1, labels1 = ax1.get_legend_handles_labels()
         lines2, labels2 = ax2.get_legend_handles_labels()
-        ax1.legend(lines1 + lines2, labels1 + labels2, loc='lower right')
+        ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
     else:
         ax1.legend(loc='lower right')
 
@@ -834,6 +848,13 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
 def main():
     args = parse_args()
     use_f = args.fahrenheit
+
+    # Handle output path - if it's a directory, append default base name
+    output_base = args.output
+    output_path = Path(output_base)
+    if output_path.is_dir() or output_base.endswith('/'):
+        output_path.mkdir(parents=True, exist_ok=True)
+        output_base = str(output_path / 'cpu_analysis')
 
     df = load_data(args.input)
     print(f"Loaded {len(df)} samples from: {args.input}")
@@ -866,7 +887,7 @@ def main():
 
     # Temperature timeline (requires temperature)
     if available['temperature']:
-        output_path = f"{args.output}_temp.png"
+        output_path = f"{output_base}_temp.png"
         plot_temperature_timeline(df, args.resample, args.tjmax, stats_dict, output_path, use_f)
         output_files.append(output_path)
     else:
@@ -874,13 +895,13 @@ def main():
 
     # Usage timeline (fallback when no temperature, or always available)
     if available['usage']:
-        output_path = f"{args.output}_usage.png"
+        output_path = f"{output_base}_usage.png"
         plot_usage_timeline(df, args.resample, stats_dict, output_path)
         output_files.append(output_path)
 
     # Clock analysis (requires clocks)
     if available['clocks']:
-        output_path = f"{args.output}_clocks.png"
+        output_path = f"{output_base}_clocks.png"
         plot_clock_analysis(df, args.resample, output_path, use_f, available['temperature'])
         output_files.append(output_path)
     else:
@@ -888,7 +909,7 @@ def main():
 
     # Correlation plot (requires temperature + usage)
     if available['temperature'] and available['usage']:
-        output_path = f"{args.output}_correlation.png"
+        output_path = f"{output_base}_correlation.png"
         plot_temp_vs_load(df, output_path, use_f)
         output_files.append(output_path)
     else:
@@ -896,7 +917,7 @@ def main():
 
     # Histogram (requires temperature)
     if available['temperature']:
-        output_path = f"{args.output}_histogram.png"
+        output_path = f"{output_base}_histogram.png"
         plot_temp_histogram(df, args.tjmax, stats_dict, output_path, use_f)
         output_files.append(output_path)
     else:
@@ -904,7 +925,7 @@ def main():
 
     # Power analysis (requires power)
     if available['power']:
-        output_path = f"{args.output}_power.png"
+        output_path = f"{output_base}_power.png"
         if plot_power_analysis(df, args.resample, output_path, use_f,
                                 available['temperature'], available['power_ccd']):
             output_files.append(output_path)
@@ -928,7 +949,12 @@ def main():
         if opener:
             for f in output_files:
                 if Path(f).exists():
-                    subprocess.Popen([opener, f], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    subprocess.Popen(
+                        [opener, f],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True
+                    )
         else:
             print("Warning: Could not find a command to open images")
 
