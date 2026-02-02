@@ -65,6 +65,8 @@ Examples:
                         help='Resample interval for smoothing (default: 10s)')
     parser.add_argument('--tjmax', type=float, default=95.0,
                         help='Thermal junction max temperature (default: 95)')
+    parser.add_argument('--format', choices=['png', 'svg', 'pdf'], default='png',
+                        help='Output image format (default: png)')
     parser.add_argument('--no-show', action='store_true',
                         help='Skip displaying plots (for headless use)')
     parser.add_argument('--open', action='store_true',
@@ -436,7 +438,8 @@ def get_time_locator(df: pd.DataFrame, target_ticks: int = 8):
 
 
 def plot_temperature_timeline(df: pd.DataFrame, resample: str, tjmax: float,
-                              stats_dict: dict, output_path: str, use_fahrenheit: bool = False):
+                              stats_dict: dict, output_path: str, use_fahrenheit: bool = False,
+                              **save_kwargs):
     """Create temperature timeline with min/max envelope."""
     plt.figure(figsize=(14, 7))
     unit = "°F" if use_fahrenheit else "°C"
@@ -494,11 +497,12 @@ def plot_temperature_timeline(df: pd.DataFrame, resample: str, tjmax: float,
     plt.legend(loc='upper right')
     plt.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
 
 
-def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, output_path: str):
+def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, output_path: str,
+                        **save_kwargs):
     """Create CPU usage timeline with load average overlay (fallback when no temp data)."""
     fig, ax1 = plt.subplots(figsize=(14, 7))
 
@@ -557,12 +561,13 @@ def plot_usage_timeline(df: pd.DataFrame, resample: str, stats_dict: dict, outpu
     plt.gcf().autofmt_xdate()
     fig.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
 
 
 def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
-                        use_fahrenheit: bool = False, has_temp: bool = True):
+                        use_fahrenheit: bool = False, has_temp: bool = True,
+                        **save_kwargs):
     """Create clock speed analysis with temperature overlay."""
     if 'avg_clock_mhz' not in df.columns:
         print("Skipping clock analysis: no clock data found")
@@ -641,11 +646,12 @@ def plot_clock_analysis(df: pd.DataFrame, resample: str, output_path: str,
     plt.gcf().autofmt_xdate()
     fig.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
 
 
-def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool = False):
+def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool = False,
+                      **save_kwargs):
     """Create temperature vs CPU usage scatter plot."""
     if 'usage_pct' not in df.columns:
         print("Skipping correlation plot: no usage data found")
@@ -699,12 +705,12 @@ def plot_temp_vs_load(df: pd.DataFrame, output_path: str, use_fahrenheit: bool =
 
     plt.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
 
 
 def plot_temp_histogram(df: pd.DataFrame, tjmax: float, stats_dict: dict, output_path: str,
-                        use_fahrenheit: bool = False):
+                        use_fahrenheit: bool = False, **save_kwargs):
     """Create temperature distribution histogram."""
     plt.figure(figsize=(10, 7))
     unit = "°F" if use_fahrenheit else "°C"
@@ -766,13 +772,13 @@ def plot_temp_histogram(df: pd.DataFrame, tjmax: float, stats_dict: dict, output
 
     plt.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
 
 
 def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
                         use_fahrenheit: bool = False, has_temp: bool = True,
-                        has_ccd: bool = True):
+                        has_ccd: bool = True, **save_kwargs):
     """Create power analysis chart with temperature overlay."""
     if 'power_w' not in df.columns:
         print("Skipping power analysis: no power data found")
@@ -840,7 +846,7 @@ def plot_power_analysis(df: pd.DataFrame, resample: str, output_path: str,
     plt.gcf().autofmt_xdate()
     fig.tight_layout()
 
-    plt.savefig(output_path, dpi=150)
+    plt.savefig(output_path, **save_kwargs)
     print(f"Saved: {output_path}")
     return True
 
@@ -885,49 +891,56 @@ def main():
 
     output_files = []
 
+    # Determine file extension and DPI based on format
+    ext = args.format
+    # PNG needs explicit DPI; vector formats ignore it
+    save_kwargs = {'dpi': 150} if ext == 'png' else {}
+
     # Temperature timeline (requires temperature)
     if available['temperature']:
-        output_path = f"{output_base}_temp.png"
-        plot_temperature_timeline(df, args.resample, args.tjmax, stats_dict, output_path, use_f)
+        output_path = f"{output_base}_temp.{ext}"
+        plot_temperature_timeline(df, args.resample, args.tjmax, stats_dict, output_path, use_f, **save_kwargs)
         output_files.append(output_path)
     else:
         print("Skipping temperature timeline: no temperature data")
 
     # Usage timeline (fallback when no temperature, or always available)
     if available['usage']:
-        output_path = f"{output_base}_usage.png"
-        plot_usage_timeline(df, args.resample, stats_dict, output_path)
+        output_path = f"{output_base}_usage.{ext}"
+        plot_usage_timeline(df, args.resample, stats_dict, output_path, **save_kwargs)
         output_files.append(output_path)
 
     # Clock analysis (requires clocks)
     if available['clocks']:
-        output_path = f"{output_base}_clocks.png"
-        plot_clock_analysis(df, args.resample, output_path, use_f, available['temperature'])
+        output_path = f"{output_base}_clocks.{ext}"
+        plot_clock_analysis(df, args.resample, output_path, use_f, available['temperature'],
+                            **save_kwargs)
         output_files.append(output_path)
     else:
         print("Skipping clock analysis: no clock data")
 
     # Correlation plot (requires temperature + usage)
     if available['temperature'] and available['usage']:
-        output_path = f"{output_base}_correlation.png"
-        plot_temp_vs_load(df, output_path, use_f)
+        output_path = f"{output_base}_correlation.{ext}"
+        plot_temp_vs_load(df, output_path, use_f, **save_kwargs)
         output_files.append(output_path)
     else:
         print("Skipping correlation plot: requires both temperature and usage data")
 
     # Histogram (requires temperature)
     if available['temperature']:
-        output_path = f"{output_base}_histogram.png"
-        plot_temp_histogram(df, args.tjmax, stats_dict, output_path, use_f)
+        output_path = f"{output_base}_histogram.{ext}"
+        plot_temp_histogram(df, args.tjmax, stats_dict, output_path, use_f, **save_kwargs)
         output_files.append(output_path)
     else:
         print("Skipping temperature histogram: no temperature data")
 
     # Power analysis (requires power)
     if available['power']:
-        output_path = f"{output_base}_power.png"
+        output_path = f"{output_base}_power.{ext}"
         if plot_power_analysis(df, args.resample, output_path, use_f,
-                                available['temperature'], available['power_ccd']):
+                                available['temperature'], available['power_ccd'],
+                                **save_kwargs):
             output_files.append(output_path)
 
     if not output_files:
